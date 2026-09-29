@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>温室分区轮灌编排台</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">💧</span>
+    <div>
+      <h1>温室分区轮灌编排台</h1>
+      <p class="subtitle">15 分钟粒度 · 总流量 / 阀门并发 / 停水时段约束</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <nav class="page-tabs">
+      <a class="btn primary" href="/">💧 轮灌编排台</a>
+      <a class="btn" href="/water">🧪 水质监测</a>
+      <a class="btn" href="/disease">🔬 病害追踪</a>
+      <a class="btn" href="/heat">🌡️ 积温预测</a>
+      <a class="btn" href="/drip">💧 滴灌巡检</a>
+      <a class="btn" href="/fertilizer">⚗️ 母液分罐</a>
+    </nav>
+    <label class="date-box">计划日期
+      <input type="date" id="plan-date">
+    </label>
+    <label class="date-box">总流量上限
+      <span class="flow-input"><input type="number" id="total-flow" min="1" step="1"> L/min</span>
+    </label>
+    <button class="btn primary" id="btn-generate">⚙ 自动编排</button>
+    <button class="btn" id="btn-save">💾 保存计划</button>
+    <a class="btn" href="/api/export" id="btn-export">⬇ 导出 JSON</a>
+    <button class="btn warn" id="btn-sample">↺ 恢复示例</button>
+    <button class="btn danger" id="btn-clear">🗑 清空重置</button>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- 左侧：数据录入 -->
+  <aside class="sidebar">
+    <section class="card">
+      <h2>阀门 <small>并发上限</small></h2>
+      <ul class="entity-list" id="valve-list"></ul>
+      <form class="inline-form" id="valve-form">
+        <input type="text" name="name" placeholder="阀门名称" required>
+        <input type="number" name="flow_lmin" placeholder="L/min" min="1" step="0.1" required>
+        <input type="number" name="concur" placeholder="并发" min="1" step="1" value="1" required>
+        <button class="btn small" type="submit">添加</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>分区 <small>水量 / 所属阀门 / 允许时段</small></h2>
+      <ul class="entity-list" id="zone-list"></ul>
+      <form class="zone-form" id="zone-form">
+        <input type="hidden" name="id">
+        <input type="text" name="name" placeholder="分区名称（如：番茄区）" required>
+        <label>所需水量 (L)
+          <input type="number" name="water_l" min="0" step="1" required>
+        </label>
+        <label>所属阀门
+          <select name="valve_id" required></select>
+        </label>
+        <div class="time-row">
+          <label>最早
+            <input type="time" name="earliest" step="900" required>
+          </label>
+          <label>最晚
+            <input type="time" name="latest" step="900" required>
+          </label>
+        </div>
+        <label class="hidden" id="item-start-label">计划开始时间（留空表示取消编排）
+          <input type="time" name="item_start" step="900">
+        </label>
+        <div class="form-actions">
+          <button class="btn small primary" type="submit" id="zone-submit">添加分区</button>
+          <button class="btn small hidden" type="button" id="zone-cancel">取消编辑</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>停水时段</h2>
+      <ul class="entity-list" id="blackout-list"></ul>
+      <form class="inline-form" id="blackout-form">
+        <input type="text" name="name" placeholder="停水说明（可空）">
+        <input type="time" name="start" step="900" required>
+        <input type="time" name="end" step="900" required>
+        <button class="btn small" type="submit">添加</button>
+      </form>
+    </section>
+  </aside>
+
+  <!-- 右侧：时间轴 -->
+  <section class="main-panel">
+    <div class="status-bar" id="status-bar">
+      <span id="status-text">加载中…</span>
+      <span class="status-meta" id="status-meta"></span>
+    </div>
+    <div class="issues-panel hidden" id="issues-panel">
+      <h3>⚠ 冲突与未编排分区</h3>
+      <ul id="issues-list"></ul>
+    </div>
+    <div class="timeline-wrap">
+      <div class="timeline" id="timeline">
+        <div class="ruler-row">
+          <div class="ruler-track" id="ruler-track"></div>
+        </div>
+        <div id="tracks"></div>
+      </div>
+    </div>
+    <div class="legend">
+      <span><i class="swatch valve-0"></i>阀门 1</span>
+      <span><i class="swatch valve-1"></i>阀门 2</span>
+      <span><i class="swatch valve-2"></i>阀门 3</span>
+      <span><i class="swatch valve-other"></i>其他阀门</span>
+      <span><i class="swatch conflict"></i>冲突时段</span>
+      <span><i class="swatch blackout"></i>停水</span>
+      <span class="hint">💡 拖动色块调整灌溉时段；点击色块在左侧表单中精确修改（修改分区表单即更新时段并即时校验）。</span>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>
