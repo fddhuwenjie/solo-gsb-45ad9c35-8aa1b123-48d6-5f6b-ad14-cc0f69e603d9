@@ -9,6 +9,7 @@ from flask import Flask, Response, g, jsonify, request, send_from_directory
 
 import scheduler
 import water_quality as wq
+import water_trace as wt
 import disease_trace as dt
 import crop_heat as ch
 import drip_uniform as dri
@@ -52,7 +53,8 @@ def init_db():
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
             name      TEXT NOT NULL UNIQUE,
             flow_lmin REAL NOT NULL,
-            concur    INTEGER NOT NULL DEFAULT 1
+            concur    INTEGER NOT NULL DEFAULT 1,
+            source_id INTEGER REFERENCES water_sources(id) ON DELETE SET NULL
         );
         CREATE TABLE IF NOT EXISTS zones (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -230,6 +232,7 @@ def init_db():
         _seed_sample(db)
     if db.execute("SELECT COUNT(*) FROM water_sources").fetchone()[0] == 0:
         _seed_water(db)
+    _bind_sample_valve_sources(db)
     if db.execute("SELECT COUNT(*) FROM disease_tools").fetchone()[0] == 0:
         _seed_disease(db)
     if db.execute("SELECT COUNT(*) FROM heat_batches").fetchone()[0] == 0:
@@ -242,62 +245,78 @@ def init_db():
 
 
 def _migrate_db(db):
-    """版本化迁移：为 disease_events 增加冗余 tool_name 列。
+    """版本化迁移。
 
+    v1：为 disease_events 增加冗余 tool_name 列。
     旧表 tool_id 带外键，删除工具时只能把历史事件的 tool_id 置空，
     导致冻结案件台账丢失工具编号与名称。新表去掉该外键（删除拦截改在
     应用层，只拦开放案件），并把工具名称随事件落库，重启后仍可查询。
+
+    v2：用水回溯——为 valves 增加 source_id，每个阀门绑定一个水源。
     """
-    if db.execute("PRAGMA user_version").fetchone()[0] >= 1:
-        return
-    cols = [r["name"] for r in db.execute("PRAGMA table_info(disease_events)")]
-    if "tool_name" not in cols:
-        db.executescript(
-            """
-            CREATE TABLE disease_events_new (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                case_id    INTEGER NOT NULL REFERENCES disease_cases(id) ON DELETE CASCADE,
-                type       TEXT NOT NULL CHECK (type IN ('diagnosis','visit','disinfection')),
-                ts         TEXT NOT NULL,
-                tool_id    INTEGER,
-                tool_name  TEXT,
-                zone_id    INTEGER REFERENCES zones(id),
-                qualified  INTEGER NOT NULL DEFAULT 0,
-                note       TEXT NOT NULL DEFAULT '',
-                created    TEXT NOT NULL
-            );
-            INSERT INTO disease_events_new
-                (id, case_id, type, ts, tool_id, tool_name, zone_id, qualified, note, created)
-            SELECT e.id, e.case_id, e.type, e.ts, e.tool_id, t.name,
-                   e.zone_id, e.qualified, e.note, e.created
-            FROM disease_events e
-            LEFT JOIN disease_tools t ON t.id = e.tool_id;
-            DROP TABLE disease_events;
-            ALTER TABLE disease_events_new RENAME TO disease_events;
-            CREATE INDEX idx_disease_events_case_ts
-                ON disease_events(case_id, ts, id);
-            """
-        )
-        # 旧版本删除工具时已被置空 tool_id 的冻结案件事件，尽力从冻结快照的
-        # 事件链里还原（编号 + 名称）；不在任何最短链上的事件无法结构化还原。
-        for snap in db.execute("SELECT case_id, payload FROM disease_snapshots"):
-            try:
-                payload = json.loads(snap["payload"])
-            except (TypeError, ValueError):
-                continue
-            by_event = {}
-            for block in (payload.get("zones") or []) + (payload.get("tools") or []):
-                for c in block.get("chain") or []:
-                    if c.get("tool_id") is not None:
-                        by_event[c["id"]] = (c["tool_id"], c.get("tool_name"))
-            for eid, (tid, tname) in by_event.items():
-                db.execute(
-                    "UPDATE disease_events SET tool_id = COALESCE(tool_id, ?),"
-                    " tool_name = COALESCE(tool_name, ?)"
-                    " WHERE id = ? AND tool_name IS NULL",
-                    (tid, tname, eid))
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version < 1:
+        cols = [r["name"] for r in db.execute("PRAGMA table_info(disease_events)")]
+        if "tool_name" not in cols:
+            db.executescript(
+                """
+                CREATE TABLE disease_events_new (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    case_id    INTEGER NOT NULL REFERENCES disease_cases(id) ON DELETE CASCADE,
+                    type       TEXT NOT NULL CHECK (type IN ('diagnosis','visit','disinfection')),
+                    ts         TEXT NOT NULL,
+                    tool_id    INTEGER,
+                    tool_name  TEXT,
+                    zone_id    INTEGER REFERENCES zones(id),
+                    qualified  INTEGER NOT NULL DEFAULT 0,
+                    note       TEXT NOT NULL DEFAULT '',
+                    created    TEXT NOT NULL
+                );
+                INSERT INTO disease_events_new
+                    (id, case_id, type, ts, tool_id, tool_name, zone_id, qualified, note, created)
+                SELECT e.id, e.case_id, e.type, e.ts, e.tool_id, t.name,
+                       e.zone_id, e.qualified, e.note, e.created
+                FROM disease_events e
+                LEFT JOIN disease_tools t ON t.id = e.tool_id;
+                DROP TABLE disease_events;
+                ALTER TABLE disease_events_new RENAME TO disease_events;
+                CREATE INDEX idx_disease_events_case_ts
+                    ON disease_events(case_id, ts, id);
+                """
+            )
+            # 旧版本删除工具时已被置空 tool_id 的冻结案件事件，尽力从冻结快照的
+            # 事件链里还原（编号 + 名称）；不在任何最短链上的事件无法结构化还原。
+            for snap in db.execute("SELECT case_id, payload FROM disease_snapshots"):
+                try:
+                    payload = json.loads(snap["payload"])
+                except (TypeError, ValueError):
+                    continue
+                by_event = {}
+                for block in (payload.get("zones") or []) + (payload.get("tools") or []):
+                    for c in block.get("chain") or []:
+                        if c.get("tool_id") is not None:
+                            by_event[c["id"]] = (c["tool_id"], c.get("tool_name"))
+                for eid, (tid, tname) in by_event.items():
+                    db.execute(
+                        "UPDATE disease_events SET tool_id = COALESCE(tool_id, ?),"
+                        " tool_name = COALESCE(tool_name, ?)"
+                        " WHERE id = ? AND tool_name IS NULL",
+                        (tid, tname, eid))
+            db.commit()
+        db.execute("PRAGMA user_version = 1")
         db.commit()
-    db.execute("PRAGMA user_version = 1")
+
+    if db.execute("PRAGMA user_version").fetchone()[0] >= 2:
+        return
+    # 用水回溯：每个阀门绑定一个水源（valves.source_id）。
+    # 旧库补列；删除水源时绑定自动置空（ON DELETE SET NULL 随新列定义生效，
+    # 旧版 ALTER 新增列上的 FK 动作受支持），回溯结果改为证据不足。
+    cols = [r["name"] for r in db.execute("PRAGMA table_info(valves)")]
+    if "source_id" not in cols:
+        db.execute(
+            "ALTER TABLE valves ADD COLUMN source_id INTEGER"
+            " REFERENCES water_sources(id) ON DELETE SET NULL")
+    db.execute("PRAGMA user_version = 2")
     db.commit()
 
 
@@ -341,7 +360,42 @@ def _seed_sample(db):
     for name, start, end in SAMPLE["blackouts"]:
         db.execute("INSERT INTO blackouts(name,start_slot,end_slot) VALUES(?,?,?)",
                    (name, scheduler.hhmm_to_slot(start), scheduler.hhmm_to_slot(end)))
+
+    # 内置一份当日轮灌计划，使「用水回溯」开箱即可演示：
+    # 贪心编排结果（15 分钟槽，总流量 60 L/min，07:30–08:00 停水）：
+    #   育苗区 07:00–07:45、番茄区 08:00–10:00、草莓区 05:30–08:00、
+    #   黄瓜区 18:00–19:30、叶菜区 10:00–10:30。
     db.commit()
+    _seed_schedule(db)
+
+
+def _bind_sample_valve_sources(db):
+    """把示例阀门绑到示例水源（北侧/中部干管 -> 机井水；苗床支管不绑）。
+
+    在水源与阀门均就绪后调用；只设置仍为 NULL 的绑定，避免覆盖用户改动。
+    """
+    well = db.execute(
+        "SELECT id FROM water_sources WHERE name=?", ("1# 机井水",)).fetchone()
+    if well is None:
+        return
+    for name in ("北侧干管", "中部干管"):
+        db.execute(
+            "UPDATE valves SET source_id=? WHERE name=? AND source_id IS NULL",
+            (well["id"], name))
+
+
+def _seed_schedule(db):
+    """用当前示例对象贪心编排并写入 schedule_items（供用水回溯演示）。"""
+    valves = [valve_dict(r) for r in db.execute("SELECT * FROM valves ORDER BY id")]
+    zones = [zone_dict(r, {v["id"]: v for v in valves})
+             for r in db.execute("SELECT * FROM zones ORDER BY id")]
+    blackouts = [blackout_dict(r)
+                 for r in db.execute("SELECT * FROM blackouts ORDER BY id")]
+    result = scheduler.generate(zones, valves, blackouts, SAMPLE["total_flow"])
+    for it in result["items"]:
+        db.execute(
+            "INSERT INTO schedule_items(zone_id,start_slot,length) VALUES(?,?,?)",
+            (it["zone_id"], it["start_slot"], it["length"]))
 
 
 # ---------------------------------------------------------------- 水质示例数据
@@ -662,7 +716,8 @@ def _seed_fertilizer(db):
 
 def valve_dict(row):
     return {"id": row["id"], "name": row["name"],
-            "flow_lmin": row["flow_lmin"], "concur": row["concur"]}
+            "flow_lmin": row["flow_lmin"], "concur": row["concur"],
+            "source_id": row["source_id"] if "source_id" in row.keys() else None}
 
 
 def zone_dict(row, valve_by_id):
@@ -905,10 +960,11 @@ def api_reset():
         "DELETE FROM blackouts; DELETE FROM valves;"
     )
     if data.get("sample"):
-        _seed_sample(db)
+        _seed_sample(db)  # 内部已贪心生成示例当日计划
         # 分区重建后补回水质 / 病害 / 积温 / 滴灌示例（水源与案件如已被用户保留则不重复）
         if db.execute("SELECT COUNT(*) FROM water_sources").fetchone()[0] == 0:
             _seed_water(db)
+        _bind_sample_valve_sources(db)
         if db.execute("SELECT COUNT(*) FROM disease_tools").fetchone()[0] == 0:
             _seed_disease(db)
         if db.execute("SELECT COUNT(*) FROM heat_batches").fetchone()[0] == 0:
@@ -925,6 +981,27 @@ def api_reset():
 
 # ---------------------------------------------------------------- API: 阀门
 
+def _parse_source_id(data, db, keep_if_absent=None):
+    """解析阀门水源绑定。
+
+    显式传 null / "" / 0 -> 解除绑定（None）；
+    缺省字段且 keep_if_absent 给定时沿用原值（兼容轮灌页的阀门编辑器）；
+    否则必须为已有水源 ID。
+    """
+    if "source_id" not in data:
+        return keep_if_absent
+    raw = data.get("source_id", None)
+    if raw in (None, "", 0):
+        return None
+    try:
+        sid = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("水源绑定必须为水源 ID")
+    if not db.execute("SELECT id FROM water_sources WHERE id=?", (sid,)).fetchone():
+        raise ValueError("绑定的水源不存在")
+    return sid
+
+
 @app.post("/api/valves")
 def api_create_valve():
     data = request.get_json(silent=True) or {}
@@ -932,13 +1009,14 @@ def api_create_valve():
         require_fields(data, ["name"])
         flow = parse_num(data, "flow_lmin", "阀门额定流量", positive=True)
         concur = parse_num(data, "concur", "并发上限", integer=True)
+        db = get_db()
+        source_id = _parse_source_id(data, db)
+        cur = db.execute(
+            "INSERT INTO valves(name,flow_lmin,concur,source_id) VALUES(?,?,?,?)",
+            (data["name"].strip(), flow, concur, source_id))
+        db.commit()
     except ValueError as e:
         return bad(str(e))
-    db = get_db()
-    try:
-        cur = db.execute("INSERT INTO valves(name,flow_lmin,concur) VALUES(?,?,?)",
-                         (data["name"].strip(), flow, concur))
-        db.commit()
     except sqlite3.IntegrityError:
         return bad("阀门名称已存在")
     return jsonify({"id": cur.lastrowid}), 201
@@ -948,20 +1026,41 @@ def api_create_valve():
 def api_update_valve(vid, ):
     data = request.get_json(silent=True) or {}
     db = get_db()
-    if not db.execute("SELECT id FROM valves WHERE id=?", (vid,)).fetchone():
+    row = db.execute("SELECT id,source_id FROM valves WHERE id=?", (vid,)).fetchone()
+    if not row:
         return bad("阀门不存在", 404)
     try:
         require_fields(data, ["name"])
         flow = parse_num(data, "flow_lmin", "阀门额定流量", positive=True)
         concur = parse_num(data, "concur", "并发上限", integer=True)
+        # 轮灌页的阀门编辑器不带 source_id：缺省即沿用当前绑定
+        source_id = _parse_source_id(data, db, keep_if_absent=row["source_id"])
     except ValueError as e:
         return bad(str(e))
     try:
-        db.execute("UPDATE valves SET name=?,flow_lmin=?,concur=? WHERE id=?",
-                   (data["name"].strip(), flow, concur, vid))
+        db.execute(
+            "UPDATE valves SET name=?,flow_lmin=?,concur=?,source_id=? WHERE id=?",
+            (data["name"].strip(), flow, concur, source_id, vid))
         db.commit()
     except sqlite3.IntegrityError:
         return bad("阀门名称已存在")
+    return jsonify(build_state())
+
+
+@app.put("/api/valves/<int:vid>/source")
+def api_update_valve_source(vid):
+    """仅修改阀门的水源绑定（水质页用），不触碰流量 / 并发 / 计划。"""
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    if not db.execute("SELECT id FROM valves WHERE id=?", (vid,)).fetchone():
+        return bad("阀门不存在", 404)
+    try:
+        source_id = _parse_source_id(data, db)
+    except ValueError as e:
+        return bad(str(e))
+    db.execute("UPDATE valves SET source_id=? WHERE id=?", (source_id, vid))
+    db.commit()
+    # 绑定修改后用水回溯按新水源重新核算（计划本身不改动）
     return jsonify(build_state())
 
 
@@ -1157,7 +1256,6 @@ def build_water_state(source_id=None, day=None, limit=50):
     db = get_db()
     source_rows = db.execute(
         "SELECT * FROM water_sources ORDER BY id").fetchall()
-
     if source_id is None and source_rows:
         source_id = source_rows[0]["id"]
     selected = next((r for r in source_rows if r["id"] == source_id), None)
@@ -1184,12 +1282,22 @@ def build_water_state(source_id=None, day=None, limit=50):
         else:
             samples = all_samples
 
+    plan_date = db.execute(
+        "SELECT value FROM settings WHERE key='plan_date'").fetchone()
+    valves = [valve_dict(r) for r in db.execute(
+        "SELECT * FROM valves ORDER BY id")]
+    source_names = {r["id"]: r["name"] for r in source_rows}
+    for v in valves:
+        v["source_name"] = source_names.get(v["source_id"])
+
     return {
         "metrics": metrics_meta,
         "overall_status": wq.merge_status([c["status"] for c in cards]),
         "sources": cards,
         "selected_id": selected["id"] if selected else None,
         "date": day or "",
+        "plan_date": plan_date["value"] if plan_date else "",
+        "valves": valves,
         "ranges": {k: {"low": ranges[k][0], "high": ranges[k][1]}
                    for k in wq.METRIC_KEYS},
         "samples": samples,
@@ -1215,6 +1323,72 @@ def build_water_export(source_id=None, day=None):
             for s in state["sources"]
         ],
         "samples": state["samples"],
+    }
+
+
+# ---------------------------------------------------------------- API: 水质监测 - 用水回溯
+
+def build_water_trace(day=None, zone_id=None):
+    """按计划日期把现有 15 分钟灌溉时段与各水源半开状态区间求交。
+
+    纯按需核算：读取当前计划、阀门绑定、水源区间与全部采样，
+    实时调用 water_trace.trace_day；不写入、不改动原计划。
+    """
+    db = get_db()
+    settings = {r["key"]: r["value"]
+                for r in db.execute("SELECT key,value FROM settings")}
+    day_raw = day or settings.get("plan_date") or date.today().isoformat()
+    try:
+        day_dt = wt.parse_day(day_raw)
+    except ValueError:
+        raise ValueError(f"计划日期格式错误：{day_raw}（应为 YYYY-MM-DD）")
+
+    if zone_id is not None and not db.execute(
+            "SELECT id FROM zones WHERE id=?", (zone_id,)).fetchone():
+        raise KeyError("分区不存在")
+
+    valve_rows = db.execute("SELECT * FROM valves ORDER BY id").fetchall()
+    valves = [valve_dict(r) for r in valve_rows]
+    zones = [dict(id=r["id"], name=r["name"], valve_id=r["valve_id"])
+             for r in db.execute("SELECT id,name,valve_id FROM zones ORDER BY id")]
+    items = [dict(zone_id=r["zone_id"], start_slot=r["start_slot"],
+                  length=r["length"])
+             for r in db.execute(
+                 "SELECT zone_id,start_slot,length FROM schedule_items"
+                 " ORDER BY start_slot,zone_id")]
+
+    source_rows = db.execute("SELECT id,name FROM water_sources ORDER BY id").fetchall()
+    source_names = {r["id"]: r["name"] for r in source_rows}
+    samples_by_source = {}
+    ranges_by_source = {}
+    for r in source_rows:
+        sid = r["id"]
+        ranges_by_source[sid] = _ranges_for(db, sid)
+        samples_by_source[sid] = [
+            {k: row[k] for k in
+             ("id", "source_id", "ts", "ph", "ec", "turbidity", "nitrate")}
+            for row in db.execute(
+                "SELECT id,source_id,ts,ph,ec,turbidity,nitrate FROM water_samples"
+                " WHERE source_id=? ORDER BY ts,id", (sid,))]
+
+    result = wt.trace_day(
+        zones, items, valves, samples_by_source, ranges_by_source,
+        day_dt, slot_min=scheduler.SLOT_MIN, source_names=source_names,
+        zone_filter=zone_id)
+    result["plan_date"] = settings.get("plan_date", "")
+    return result
+
+
+def build_water_trace_export(day=None, zone_id=None):
+    trace = build_water_trace(day=day, zone_id=zone_id)
+    return {
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "plan_date": trace["plan_date"],
+        "date": trace["date"],
+        "slot_minutes": trace["slot_minutes"],
+        "summary": trace["summary"],
+        "unbound_valves": trace["unbound_valves"],
+        "zones": trace["zones"],
     }
 
 
@@ -1288,6 +1462,8 @@ def api_water_delete_source(sid):
         return bad("水源不存在", 404)
     db.execute("DELETE FROM water_samples WHERE source_id=?", (sid,))
     db.execute("DELETE FROM water_ranges WHERE source_id=?", (sid,))
+    # 阀门绑定经外键 ON DELETE SET NULL 自动解除（双保险显式置空）
+    db.execute("UPDATE valves SET source_id=NULL WHERE source_id=?", (sid,))
     db.execute("DELETE FROM water_sources WHERE id=?", (sid,))
     db.commit()
     return jsonify(build_water_state())
@@ -1361,6 +1537,38 @@ def api_water_delete_sample(sample_id):
 
 
 # ---------------------------------------------------------------- API: 导出
+
+@app.get("/api/water/trace")
+def api_water_trace():
+    day = (request.args.get("date") or "").strip() or None
+    zone_id = request.args.get("zone_id", type=int)
+    try:
+        return jsonify(build_water_trace(day=day, zone_id=zone_id))
+    except KeyError as e:
+        return bad(str(e).strip("'"), 404)
+    except ValueError as e:
+        return bad(str(e))
+
+
+@app.get("/api/water/trace/export")
+def api_water_trace_export():
+    day = (request.args.get("date") or "").strip() or None
+    zone_id = request.args.get("zone_id", type=int)
+    try:
+        payload = build_water_trace_export(day=day, zone_id=zone_id)
+    except KeyError as e:
+        return bad(str(e).strip("'"), 404)
+    except ValueError as e:
+        return bad(str(e))
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    tag = payload["date"]
+    ztag = zone_id or "all"
+    fname = f"water-trace-{tag}-zone{ztag}.json"
+    resp = Response(body, mimetype="application/json; charset=utf-8")
+    resp.headers["Content-Disposition"] = \
+        f"attachment; filename=water-trace.json; filename*=UTF-8''{fname}"
+    return resp
+
 
 @app.get("/api/water/export")
 def api_water_export():

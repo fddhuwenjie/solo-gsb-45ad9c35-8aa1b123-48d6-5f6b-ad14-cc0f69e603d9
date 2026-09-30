@@ -3,9 +3,12 @@
   "use strict";
 
   const STATUS_TEXT = { normal: "正常", observing: "观察", exceeded: "超标" };
+  const CLASS_TEXT = { risk: "风险", review: "待复核", safe: "正常", insufficient: "证据不足" };
   const METRIC_ORDER = ["ph", "ec", "turbidity", "nitrate"];
 
   let state = null;
+  let trace = null;
+  const traceFilter = { date: "", zoneId: null };
   const filter = { source_id: null, date: "" };
 
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -46,6 +49,7 @@
   }
 
   function fmtTs(ts) { return String(ts).replace("T", " "); }
+  function fmtHm(ts) { return String(ts).slice(11, 16); }
   function fmtNum(v) { return (Math.round(v * 100) / 100).toString(); }
 
   function metricMeta(key) {
@@ -64,10 +68,30 @@
     return "/api/water/state?" + p.toString();
   }
 
+  function traceUrl(extra = {}) {
+    const p = new URLSearchParams();
+    if (traceFilter.date) p.set("date", traceFilter.date);
+    const zid = extra.zoneId !== undefined ? extra.zoneId : traceFilter.zoneId;
+    if (zid) p.set("zone_id", zid);
+    return "/api/water/trace?" + p.toString();
+  }
+
+  async function loadTrace() {
+    trace = await api(traceUrl());
+    // 保留当前日期的全量分区清单，供筛选下拉在单分区视图下切换
+    try {
+      const full = await api(traceUrl({ zoneId: null }));
+      trace._all_zones = full.zones;
+    } catch (e) { trace._all_zones = trace.zones; }
+    renderTrace();
+  }
+
   async function load() {
     state = await api(stateUrl());
     if (state.selected_id) filter.source_id = state.selected_id;
+    if (!traceFilter.date && state.plan_date) traceFilter.date = state.plan_date;
     renderAll();
+    try { await loadTrace(); } catch (e) { toast(e.message, true); }
   }
 
   function renderAll() {
@@ -77,6 +101,8 @@
     renderRanges();
     renderCharts();
     renderTable();
+    renderValveBindings();
+    renderTraceControls();
     syncMetaForm();
   }
 
@@ -313,6 +339,130 @@
     } catch (e) { toast(e.message, true); }
   }
 
+  // ------------------------------------------------------------ 阀门水源绑定
+
+  function renderValveBindings() {
+    const ul = $("#valve-bind-list");
+    ul.innerHTML = "";
+    if (!state.valves.length) {
+      ul.innerHTML = `<li class="entity-row" style="color:var(--ink-soft)">暂无阀门，请先在轮灌编排台添加</li>`;
+      return;
+    }
+    state.valves.forEach((v) => {
+      const li = document.createElement("li");
+      li.className = "entity-row valve-bind-row";
+      const opts =
+        `<option value="">（未绑定）</option>` +
+        state.sources.map((s) =>
+          `<option value="${s.id}"${s.id === v.source_id ? " selected" : ""}>` +
+          `${escapeHtml(s.name)}</option>`).join("");
+      li.innerHTML =
+        `<span class="grow">
+           <span class="name">${escapeHtml(v.name)}</span>
+           <div class="meta">${fmtNum(v.flow_lmin)} L/min${v.source_name ? " · 当前：" + escapeHtml(v.source_name) : " · 未绑定水源"}</div>
+         </span>
+         <select class="bind-select" data-valve="${v.id}" title="绑定水源">${opts}</select>`;
+      li.querySelector(".bind-select").addEventListener("change", async (e) => {
+        const source_id = e.target.value ? Number(e.target.value) : null;
+        try {
+          await api(`/api/valves/${v.id}/source`, {
+            method: "PUT", body: { source_id },
+          });
+          state = await api(stateUrl());
+          renderAll();
+          await loadTrace();
+          toast(source_id ? `已绑定水源，回溯已重新核算` : "已解除绑定，回溯标记为证据不足");
+        } catch (err) { toast(err.message, true); }
+      });
+      ul.appendChild(li);
+    });
+  }
+
+  // ------------------------------------------------------------ 用水回溯
+
+  function renderTraceControls() {
+    $("#trace-date").value = traceFilter.date || state.plan_date || "";
+    const sel = $("#trace-zone");
+    // 分区选项始终取当前日期的全量回溯结果，便于在筛选单一分区后切回其他分区
+    const rows = trace?._all_zones || trace?.zones || [];
+    sel.innerHTML = `<option value="">全部分区</option>` +
+      rows.map((r) =>
+        `<option value="${r.zone_id}"${r.zone_id === traceFilter.zoneId ? " selected" : ""}>` +
+        `${escapeHtml(r.zone_name)}</option>`).join("");
+  }
+
+  function sourceLabel(o) {
+    if (o.source_kind === "sample")
+      return `当日采样 ${fmtTs(o.source_sample_ts)}`;
+    if (o.source_kind === "carry")
+      return `历史采样 ${fmtTs(o.source_sample_ts)}`;
+    if (o.source_kind === "unbound") return "阀门未绑定水源";
+    return "无历史样本";
+  }
+
+  function renderTrace() {
+    const box = $("#trace-summary");
+    const tbody = $("#trace-rows");
+    const hint = $("#trace-hint");
+    box.innerHTML = "";
+    tbody.innerHTML = "";
+    if (!trace) return;
+    $("#trace-date").value = traceFilter.date || trace.date || "";
+
+    const s = trace.summary;
+    const chips = [
+      ["risk", `风险水量 ${fmtNum(s.risk_l)} L（${s.risk_zones.length} 区）`],
+      ["review", `待复核 ${fmtNum(s.review_l)} L（${s.review_zones.length} 区）`],
+      ["insufficient", `证据不足 ${fmtNum(s.insufficient_l)} L（${s.insufficient_zones.length} 区）`],
+      ["safe", `正常用水 ${fmtNum(s.safe_l)} L`],
+    ];
+    chips.forEach(([k, text]) => {
+      const span = document.createElement("span");
+      span.className = "trace-chip chip-" + k;
+      span.textContent = text;
+      box.appendChild(span);
+    });
+    if (trace.unbound_valves.length) {
+      const span = document.createElement("span");
+      span.className = "trace-chip chip-insufficient";
+      span.textContent = "未绑定水源阀门：" +
+        trace.unbound_valves.map((v) => v.name).join("、");
+      box.appendChild(span);
+    }
+
+    if (!trace.zones.length) {
+      tbody.innerHTML =
+        `<tr class="empty-row"><td colspan="8">该日期没有已编排的 15 分钟灌溉时段` +
+        `（回溯读取现有计划，不改动原计划）</td></tr>`;
+      hint.textContent = "提示：可在轮灌编排台为该计划日期生成或调整计划后再核算。";
+      return;
+    }
+    hint.textContent = "采样时刻起采用新状态；当日首条采样前沿用最近历史采样，无历史样本标为证据不足。" +
+      "超标 / 观察区间分别计为风险 / 待复核，水量 = 阀门流量 × 重叠分钟。";
+
+    trace.zones.forEach((r) => {
+      const tr = document.createElement("tr");
+      tr.className = "trace-zone-row klass-" + r.klass;
+      const srcText = r.source_name
+        ? `${escapeHtml(r.valve_name || "—")} / ${escapeHtml(r.source_name)}`
+        : `${escapeHtml(r.valve_name || "—")} / <em>未绑定</em>`;
+      tr.innerHTML =
+        `<td>${escapeHtml(r.zone_name)}</td>
+         <td>${fmtHm(r.start)}–${fmtHm(r.end)}（${r.planned_minutes} 分钟）</td>
+         <td>${srcText}</td>
+         <td><span class="badge trace-badge ${r.klass}">${CLASS_TEXT[r.klass]}</span></td>
+         <td class="num">${r.risk_l ? fmtNum(r.risk_l) : "—"}</td>
+         <td class="num">${r.review_l ? fmtNum(r.review_l) : "—"}</td>
+         <td class="triggers">${r.triggers.length ? escapeHtml(r.triggers.join("、")) : "—"}</td>
+         <td class="trace-src">${r.overlaps.map((o) =>
+           `${fmtHm(o.start)}–${fmtHm(o.end)}：${escapeHtml(sourceLabel(o))}`)
+           .join("<br>")}</td>`;
+      tbody.appendChild(tr);
+    });
+
+    renderTraceControls();
+  }
+
   // ------------------------------------------------------------ 表单
 
   function bindForms() {
@@ -429,6 +579,26 @@
       if (state.selected_id) p.set("source_id", state.selected_id);
       if (filter.date) p.set("date", filter.date);
       window.location.href = "/api/water/export?" + p.toString();
+    });
+
+    $("#btn-trace-apply").addEventListener("click", async () => {
+      traceFilter.date = $("#trace-date").value || "";
+      traceFilter.zoneId = Number($("#trace-zone").value) || null;
+      try { await loadTrace(); } catch (e) { toast(e.message, true); }
+    });
+    $("#trace-zone").addEventListener("change", () => {
+      traceFilter.zoneId = Number($("#trace-zone").value) || null;
+      loadTrace().catch((e) => toast(e.message, true));
+    });
+    $("#btn-trace-clear").addEventListener("click", () => {
+      traceFilter.zoneId = null;
+      loadTrace().catch((e) => toast(e.message, true));
+    });
+    $("#btn-trace-export").addEventListener("click", () => {
+      const p = new URLSearchParams();
+      if (traceFilter.date) p.set("date", traceFilter.date);
+      if (traceFilter.zoneId) p.set("zone_id", traceFilter.zoneId);
+      window.location.href = "/api/water/trace/export?" + p.toString();
     });
   }
 
