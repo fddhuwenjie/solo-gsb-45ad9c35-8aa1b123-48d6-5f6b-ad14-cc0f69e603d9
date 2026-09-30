@@ -120,7 +120,8 @@ body {
 .entity-row .icon-btn.del:hover { color: var(--red); background: var(--red-bg); }
 
 .inline-form { display: grid; grid-template-columns: 1fr 64px 52px auto; gap: 6px; }
-.inline-form input, .zone-form input, .zone-form select {
+#valve-form.inline-form { grid-template-columns: minmax(90px, 1fr) 64px 52px minmax(110px, 1fr) auto; }
+.inline-form input, .inline-form select, .zone-form input, .zone-form select {
   font: inherit; padding: 6px 8px; border: 1px solid var(--line);
   border-radius: 6px; background: #fff; width: 100%; min-width: 0;
 }

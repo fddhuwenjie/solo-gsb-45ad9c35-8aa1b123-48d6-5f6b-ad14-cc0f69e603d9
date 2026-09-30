@@ -4,9 +4,17 @@
 
   const STATUS_TEXT = { normal: "正常", observing: "观察", exceeded: "超标" };
   const METRIC_ORDER = ["ph", "ec", "turbidity", "nitrate"];
+  const VERDICT_TEXT = { risk: "风险", review: "待复核", unknown: "证据不足", safe: "正常" };
+  const KIND_TEXT = {
+    sample: "当日采样", history: "沿用最近历史采样",
+    none: "无历史样本", unbound: "阀门未绑定水源",
+  };
 
   let state = null;
+  let planZones = [];
   const filter = { source_id: null, date: "" };
+  const tbFilter = { date: "", zone_id: "" };
+  let tbState = null;
 
   const $ = (sel, root = document) => root.querySelector(sel);
 
@@ -65,15 +73,23 @@
   }
 
   async function load() {
-    state = await api(stateUrl());
+    const [water, plan] = await Promise.all([
+      api(stateUrl()),
+      api("/api/state").catch(() => null),
+    ]);
+    state = water;
+    planZones = plan ? plan.zones : [];
     if (state.selected_id) filter.source_id = state.selected_id;
+    if (!tbFilter.date) tbFilter.date = state.plan_date || "";
     renderAll();
+    loadTraceback().catch((e) => toast(e.message, true));
   }
 
   function renderAll() {
     renderSources();
     renderSummary();
     renderFilterBar();
+    renderBindings();
     renderRanges();
     renderCharts();
     renderTable();
@@ -152,6 +168,133 @@
     filter.source_id = id;
     filter.date = "";
     try { await load(); } catch (e) { toast(e.message, true); }
+  }
+
+  // ------------------------------------------------------------ 阀门水源绑定
+
+  function renderBindings() {
+    const ul = $("#binding-list");
+    ul.innerHTML = "";
+    if (!state.valves || !state.valves.length) {
+      ul.innerHTML = `<li class="entity-row" style="color:var(--ink-soft)">暂无阀门，请先在轮灌编排台添加</li>`;
+      return;
+    }
+    state.valves.forEach((v) => {
+      const li = document.createElement("li");
+      li.className = "entity-row binding-row";
+      const opts =
+        `<option value="">（未绑定）</option>` +
+        state.sources.map((s) =>
+          `<option value="${s.id}"${s.id === v.source_id ? " selected" : ""}>` +
+          `${escapeHtml(s.name)}</option>`).join("");
+      li.innerHTML =
+        `<span class="grow">
+           <span class="name">${escapeHtml(v.name)}</span>
+           <div class="meta">${fmtNum(v.flow_lmin)} L/min${v.source_name ? " · 当前：" + escapeHtml(v.source_name) : " · 未绑定"}</div>
+         </span>
+         <select data-valve="${v.id}" class="binding-select">${opts}</select>`;
+      li.querySelector(".binding-select").addEventListener("change", async (e) => {
+        const raw = e.target.value;
+        try {
+          state = await api(`/api/water/valves/${v.id}/binding`, {
+            method: "PUT",
+            body: { source_id: raw === "" ? null : Number(raw) },
+          });
+          renderBindings();
+          await loadTraceback();
+          toast(raw === "" ? `阀门「${v.name}」已解绑` : `阀门「${v.name}」已绑定水源，回溯已重算`);
+        } catch (err) { toast(err.message, true); renderBindings(); }
+      });
+      ul.appendChild(li);
+    });
+  }
+
+  // ------------------------------------------------------------ 用水回溯
+
+  function tbUrl(extra = {}) {
+    const p = new URLSearchParams();
+    const day = extra.date !== undefined ? extra.date : tbFilter.date;
+    if (day) p.set("date", day);
+    const zid = extra.zone_id !== undefined ? extra.zone_id : tbFilter.zone_id;
+    if (zid) p.set("zone_id", zid);
+    return "/api/water/traceback?" + p.toString();
+  }
+
+  async function loadTraceback() {
+    $("#tb-date").value = tbFilter.date || state.plan_date || "";
+    const zsel = $("#tb-zone");
+    const keep = tbFilter.zone_id;
+    zsel.innerHTML = `<option value="">全部分区</option>` + planZones
+      .map((z) => `<option value="${z.id}"${String(z.id) === String(keep) ? " selected" : ""}>` +
+        `${escapeHtml(z.name)}（${escapeHtml(z.valve_name)}）</option>`).join("");
+    if (!tbFilter.date) return;
+    tbState = await api(tbUrl());
+    renderTraceback();
+  }
+
+  function fmtDt(ts) { return String(ts || "").replace("T", " ").slice(5, 16); }
+
+  function renderTraceback() {
+    const summary = $("#tb-summary");
+    const tbody = $("#tb-rows");
+    summary.innerHTML = "";
+    tbody.innerHTML = "";
+    if (!tbState) return;
+    const t = tbState.totals;
+    const chips = [
+      ["risk", `风险水 ${fmtNum(t.risk_l)} L / ${fmtNum(t.risk_min)} 分钟`],
+      ["review", `待复核 ${fmtNum(t.review_l)} L / ${fmtNum(t.review_min)} 分钟`],
+      ["unknown", `证据不足 ${fmtNum(t.unknown_l)} L / ${fmtNum(t.unknown_min)} 分钟`],
+      ["safe", `正常 ${fmtNum(t.safe_l)} L / ${fmtNum(t.safe_min)} 分钟`],
+    ];
+    chips.forEach(([cls, text]) => {
+      const li = document.createElement("li");
+      li.className = `tb-chip tb-${cls}`;
+      li.innerHTML = `<span class="dot ${cls === "risk" ? "exceeded" : cls === "review" ? "observing" : cls === "unknown" ? "unknown" : "normal"}"></span>${text}`;
+      summary.appendChild(li);
+    });
+    const cnt = document.createElement("li");
+    cnt.className = "tb-chip tb-meta";
+    cnt.textContent = `${tbState.day} · 已编排 ${t.planned_zones} 个分区：风险 ${t.verdict_counts.risk} · 待复核 ${t.verdict_counts.review} · 证据不足 ${t.verdict_counts.unknown} · 正常 ${t.verdict_counts.safe}`;
+    summary.appendChild(cnt);
+
+    if (!tbState.zones.length) {
+      tbody.innerHTML = `<tr class="empty-row"><td colspan="10">该计划日期没有已编排的灌溉时段（请先在轮灌编排台生成 / 保存计划）</td></tr>`;
+      return;
+    }
+    tbState.zones.forEach((z) => {
+      const tr = document.createElement("tr");
+      const evidence = z.evidence.map((e) =>
+        `<span class="ev-tag ${e.source_kind}" title="${KIND_TEXT[e.source_kind]}">` +
+        `${KIND_TEXT[e.source_kind]} · ${fmtDt(e.ts)} · ${STATUS_TEXT[e.status] || "证据不足"}` +
+        (e.triggers.length ? "（" + e.triggers.map(escapeHtml).join("、") + "）" : "") +
+        `</span>`).join("");
+      const reasons = z.reasons.length
+        ? `<div class="tb-reason">${z.reasons.map(escapeHtml).join("；")}</div>` : "";
+      tr.innerHTML =
+        `<td class="tb-zone">${escapeHtml(z.zone)}</td>
+         <td class="nowrap">${z.start}–${z.end}<div class="meta">${z.duration_min} 分钟</div></td>
+         <td class="nowrap">${escapeHtml(z.valve || "（未绑定阀门）")}<div class="meta">${z.source ? escapeHtml(z.source) : "未绑定水源"} · ${fmtNum(z.flow_lmin)} L/min</div></td>
+         <td><span class="badge tb-badge-${z.verdict}">${VERDICT_TEXT[z.verdict]}</span>${reasons}</td>
+         <td class="${z.risk_l > 0 ? "violation" : ""}">${fmtNum(z.risk_l)}</td>
+         <td class="${z.review_l > 0 ? "tb-review-num" : ""}">${fmtNum(z.review_l)}</td>
+         <td class="${z.unknown_l > 0 ? "tb-unknown-num" : ""}">${fmtNum(z.unknown_l)}</td>
+         <td class="triggers">${z.triggers.length ? escapeHtml(z.triggers.join("、")) : "—"}</td>
+         <td class="tb-evidence">${evidence || "—"}</td>
+         <td><button class="del-btn" title="查看分段明细">▤</button></td>`;
+      tr.querySelector(".del-btn").addEventListener("click", () => showPieces(z));
+      tbody.appendChild(tr);
+    });
+  }
+
+  function showPieces(z) {
+    const lines = z.pieces.map((p) =>
+      `${fmtDt(p.start)}–${fmtDt(p.end)}（${fmtNum(p.minutes)} 分钟）` +
+      `\n  状态：${STATUS_TEXT[p.status] || "证据不足"} → ${VERDICT_TEXT[p.classification]}` +
+      `，水量 ${fmtNum(p.liters)} L（${fmtNum(z.flow_lmin)} L/min）` +
+      `\n  来源：${KIND_TEXT[p.source_kind]}${p.source_ts ? " · " + fmtDt(p.source_ts) : ""}` +
+      (p.triggers.length ? `\n  触发：${p.triggers.join("、")}` : ""));
+    alert(`【${z.zone}】${z.start}–${z.end} 分段明细\n\n` + lines.join("\n\n"));
   }
 
   // ------------------------------------------------------------ 区间表单
@@ -429,6 +572,23 @@
       if (state.selected_id) p.set("source_id", state.selected_id);
       if (filter.date) p.set("date", filter.date);
       window.location.href = "/api/water/export?" + p.toString();
+    });
+
+    $("#btn-tb-apply").addEventListener("click", async () => {
+      tbFilter.date = $("#tb-date").value;
+      tbFilter.zone_id = $("#tb-zone").value;
+      try { await loadTraceback(); } catch (e) { toast(e.message, true); }
+    });
+    $("#tb-zone").addEventListener("change", () => {
+      tbFilter.zone_id = $("#tb-zone").value;
+      loadTraceback().catch((e) => toast(e.message, true));
+    });
+    $("#btn-tb-export").addEventListener("click", () => {
+      if (!tbFilter.date && !state.plan_date) { toast("请先选择计划日期", true); return; }
+      const p = new URLSearchParams();
+      p.set("date", tbFilter.date || state.plan_date);
+      if (tbFilter.zone_id) p.set("zone_id", tbFilter.zone_id);
+      window.location.href = "/api/water/traceback/export?" + p.toString();
     });
   }
 

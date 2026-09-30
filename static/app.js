@@ -6,6 +6,7 @@
   const SLOTS = 96;
 
   let state = null;
+  let waterSources = [];
   let selectedZoneId = null;
   let editingValveId = null;
   let editingBlackoutId = null;
@@ -55,7 +56,12 @@
   // ------------------------------------------------------------ 加载 / 总渲染
 
   async function refresh() {
-    state = await api("/api/state");
+    const [planState, waterState] = await Promise.all([
+      api("/api/state"),
+      api("/api/water/state").catch(() => null),
+    ]);
+    state = planState;
+    waterSources = waterState ? waterState.sources : [];
     renderSettings();
     renderValves();
     renderZones();
@@ -63,6 +69,18 @@
     renderTimeline();
     renderIssues();
     syncZoneForm();
+  }
+
+  function sourceName(sourceId) {
+    const s = waterSources.find((x) => x.id === sourceId);
+    return s ? s.name : null;
+  }
+
+  function sourceOptions(selectedId) {
+    const blank = `<option value="">（未绑定 / 证据不足）</option>`;
+    return blank + waterSources.map((s) =>
+      `<option value="${s.id}"${s.id === selectedId ? " selected" : ""}>` +
+      `${escapeHtml(s.name)}</option>`).join("");
   }
 
   // ------------------------------------------------------------ 设置
@@ -97,9 +115,10 @@
         li.appendChild(buildValveEditor(v));
       } else {
         li.className = "entity-row";
+        const bound = sourceName(v.source_id);
         li.innerHTML =
           `<span class="grow"><span class="name"><i class="swatch valve-${valveColorIndex(v.id)}"></i>${escapeHtml(v.name)}</span>
-             <div class="meta">${v.flow_lmin} L/min · 并发上限 ${v.concur}</div></span>`;
+             <div class="meta">${v.flow_lmin} L/min · 并发上限 ${v.concur} · 水源：${bound ? escapeHtml(bound) : "未绑定（回溯证据不足）"}</div></span>`;
         const edit = iconButton("✏️", "编辑", () => { editingValveId = v.id; renderValves(); });
         const del = iconButton("🗑", "删除", () => removeValve(v), true);
         li.append(edit, del);
@@ -111,20 +130,25 @@
     sel.innerHTML = state.valves.length
       ? state.valves.map((v) => `<option value="${v.id}">${escapeHtml(v.name)}（${v.flow_lmin} L/min）</option>`).join("")
       : `<option value="">（请先添加阀门）</option>`;
+
+    const bindSel = $("#valve-form select[name=source_id]");
+    if (bindSel) bindSel.innerHTML = sourceOptions(null);
   }
 
   function buildValveEditor(v) {
     const wrap = document.createElement("div");
     wrap.className = "inline-form";
-    wrap.style.gridTemplateColumns = "1fr 64px 52px auto auto";
+    wrap.style.gridTemplateColumns = "1fr 64px 52px 110px auto auto";
     wrap.innerHTML =
       `<input data-k="name" value="${escapeAttr(v.name)}">
        <input data-k="flow_lmin" type="number" min="0.1" step="0.1" value="${v.flow_lmin}">
-       <input data-k="concur" type="number" min="1" step="1" value="${v.concur}">`;
+       <input data-k="concur" type="number" min="1" step="1" value="${v.concur}">
+       <select data-k="source_id">${sourceOptions(v.source_id)}</select>`;
     const saveBtn = btn("保存", async () => {
-      const body = readEditor(wrap, ["name", "flow_lmin", "concur"]);
+      const body = readEditor(wrap, ["name", "flow_lmin", "concur", "source_id"]);
       body.flow_lmin = Number(body.flow_lmin);
       body.concur = Number(body.concur);
+      body.source_id = body.source_id === "" ? null : Number(body.source_id);
       try {
         state = await api(`/api/valves/${v.id}`, { method: "PUT", body });
         editingValveId = null;
@@ -506,6 +530,8 @@
         name: f.elements.name.value.trim(),
         flow_lmin: Number(f.elements.flow_lmin.value),
         concur: Number(f.elements.concur.value),
+        source_id: f.elements.source_id.value
+          ? Number(f.elements.source_id.value) : null,
       };
       try {
         await api("/api/valves", { method: "POST", body });

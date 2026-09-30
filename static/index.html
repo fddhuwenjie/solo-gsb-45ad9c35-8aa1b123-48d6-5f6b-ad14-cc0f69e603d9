@@ -42,12 +42,13 @@
   <!-- 左侧：数据录入 -->
   <aside class="sidebar">
     <section class="card">
-      <h2>阀门 <small>并发上限</small></h2>
+      <h2>阀门 <small>并发上限 · 水源绑定（水质回溯用）</small></h2>
       <ul class="entity-list" id="valve-list"></ul>
       <form class="inline-form" id="valve-form">
         <input type="text" name="name" placeholder="阀门名称" required>
         <input type="number" name="flow_lmin" placeholder="L/min" min="1" step="0.1" required>
         <input type="number" name="concur" placeholder="并发" min="1" step="1" value="1" required>
+        <select name="source_id" title="绑定水源（水质页用水回溯依据；可留空）"></select>
         <button class="btn small" type="submit">添加</button>
       </form>
     </section>
